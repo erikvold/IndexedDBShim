@@ -7642,6 +7642,22 @@ function isPlainObject (val) { // Mirrors jQuery's
     return hasConstructorOf(val, Object);
 }
 
+function isUserObject (val) {
+    if (!val || toStringTag(val) !== 'Object') {
+        return false;
+    }
+
+    var proto = getProto(val);
+    if (!proto) { // `Object.create(null)`
+        return true;
+    }
+    return hasConstructorOf(val, Object) || isUserObject(proto);
+}
+
+function isObject (v) {
+    return v && typeof v === 'object'
+}
+
 /* Typeson - JSON with types
     * License: The MIT License (MIT)
     * Copyright (c) 2016 David Fahlander
@@ -7655,9 +7671,9 @@ function isPlainObject (val) { // Mirrors jQuery's
  * @param {{cyclic: boolean}} [options] - if cyclic (default true), cyclic references will be handled gracefully.
  */
 function Typeson (options) {
-    // Replacers signature: replace (value). Returns falsy if not replacing. Otherwise ["Date", value.getTime()]
+    // Replacers signature: replace (value). Returns falsy if not replacing. Otherwise ['Date', value.getTime()]
     var replacers = [];
-    // Revivers: map {type => reviver}. Sample: {"Date": value => new Date(value)}
+    // Revivers: map {type => reviver}. Sample: {'Date': value => new Date(value)}
     var revivers = {};
 
     /** Types registered via register() */
@@ -7667,16 +7683,23 @@ function Typeson (options) {
      *
      * Arguments works identical to those of JSON.stringify().
      */
-    this.stringify = function (obj, replacer, space) { // replacer here has nothing to do with our replacers.
-        return JSON.stringify (encapsulate(obj), replacer, space);
+    this.stringify = function (obj, replacer, space, opts) { // replacer here has nothing to do with our replacers.
+        opts = Object.assign({}, options, opts, {stringification: true});
+        var encapsulated = encapsulate(obj, null, opts);
+        if (isArray(encapsulated)) {
+            return JSON.stringify(encapsulated[0], replacer, space);
+        }
+        return encapsulated.then(function (res) {
+            return JSON.stringify(res, replacer, space);
+        });
     };
 
     /** Parse Typeson back into an obejct.
      *
      * Arguments works identical to those of JSON.parse().
      */
-    this.parse = function (text, reviver) {
-        return revive (JSON.parse (text, reviver)); // This reviver has nothing to do with our revivers.
+    this.parse = function (text, reviver, opts) {
+        return revive(JSON.parse(text, reviver), opts); // This reviver has nothing to do with our revivers.
     };
 
     /** Encapsulate a complex object into a plain Object by replacing registered types with
@@ -7685,27 +7708,72 @@ function Typeson (options) {
      * This method is used internally by Typeson.stringify().
      * @param {Object} obj - Object to encapsulate.
      */
-    var encapsulate = this.encapsulate = function (obj, stateObj) {
+    var encapsulate = this.encapsulate = function (obj, stateObj, opts) {
+        opts = Object.assign({}, options, opts);
+        var forceAsync = opts.forceAsync;
         var types = {},
-            refObjs=[], // For checking cyclic references
-            refKeys=[]; // For checking cyclic references
+            refObjs = [], // For checking cyclic references
+            refKeys = [], // For checking cyclic references
+            promisesDataRoot = [];
         // Clone the object deeply while at the same time replacing any special types or cyclic reference:
-        var cyclic = options && ('cyclic' in options) ? options.cyclic : true;
-        var ret = _encapsulate ('', obj, cyclic, stateObj || {});
-        // Add $types to result only if we ever bumped into a special type
-        if (keys(types).length) {
-            // Special if array (or primitive) was serialized because JSON would ignore custom $types prop on it.
-            if (!ret || !isPlainObject(ret) || ret.$types) return {$:ret, $types: {$: types}};
-            ret.$types = types;
+        var cyclic = opts && ('cyclic' in opts) ? opts.cyclic : true;
+        var ret = _encapsulate('', obj, cyclic, stateObj || {}, promisesDataRoot);
+        function finish (ret) {
+            // Add $types to result only if we ever bumped into a special type
+            if (keys(types).length) {
+                // Special if array (or primitive) was serialized because JSON would ignore custom $types prop on it.
+                if (!ret || !isPlainObject(ret) || ret.$types) ret = {$:ret, $types: {$: types}};
+                else ret.$types = types;
+            }
+            return ret;
         }
-        return ret;
+        function checkPromises (ret, promisesData) {
+            return Promise.all(
+                promisesData.map(function (pd) {return pd[1].p;})
+            ).then(function (promResults) {
+                return Promise.all(
+                    promResults.map(function (promResult) {
+                        var newPromisesData = [];
+                        var prData = promisesData.splice(0, 1)[0];
+                        // var [keypath, , cyclic, stateObj, parentObj, key] = prData;
+                        var keyPath = prData[0];
+                        var cyclic = prData[2];
+                        var stateObj = prData[3];
+                        var parentObj = prData[4];
+                        var key = prData[5];
+                        var encaps = _encapsulate(keyPath, promResult, cyclic, stateObj, newPromisesData);
+                        var isTypesonPromise = hasConstructorOf(encaps, TypesonPromise);
+                        if (keyPath && isTypesonPromise) { // Handle case where an embedded custom type itself returns a `Typeson.Promise`
+                            return encaps.p.then(function (encaps2) {
+                                parentObj[key] = encaps2;
+                                return checkPromises(ret, newPromisesData);
+                            });
+                        }
+                        if (keyPath) parentObj[key] = encaps;
+                        else if (isTypesonPromise) { ret = encaps.p; }
+                        else ret = encaps; // If this is itself a `Typeson.Promise` (because the original value supplied was a promise or because the supplied custom type value resolved to one), returning it below will be fine since a promise is expected anyways given current config (and if not a promise, it will be ready as the resolve value)
+                        return checkPromises(ret, newPromisesData);
+                    })
+                ).then(function () {
+                    return ret;
+                });
+            });
+        };
+        return promisesDataRoot.length ?
+            Promise.resolve(checkPromises(ret, promisesDataRoot)).then(finish)
+            : (opts.stringification && !forceAsync // If this is a promise, we don't want to resolve as above, so we return an array
+                ? [finish(ret)]
+                : (forceAsync
+                    ? Promise.resolve(finish(ret))
+                    : finish(ret)
+                ));
 
-        function _encapsulate (keypath, value, cyclic, stateObj) {
+        function _encapsulate (keypath, value, cyclic, stateObj, promisesData) {
             var $typeof = typeof value;
-            if ($typeof in {string:1, boolean:1, number:1, undefined:1 })
+            if ($typeof in {string: 1, boolean: 1, number: 1, undefined: 1 })
                 return value === undefined || ($typeof === 'number' &&
                     (isNaN(value) || value === -Infinity || value === Infinity)) ?
-                        replace(keypath, value, stateObj) :
+                        replace(keypath, value, stateObj, promisesData) :
                         value;
             if (value === null) return value;
             if (cyclic) {
@@ -7717,14 +7785,14 @@ function Typeson (options) {
                         refKeys.push(keypath);
                     }
                 } else {
-                    types[keypath] = "#";
-                    return '#'+refKeys[refIndex];
+                    types[keypath] = '#';
+                    return '#' + refKeys[refIndex];
                 }
             }
             var isPlainObj = isPlainObject(value);
             var replaced = isPlainObj ?
                 value : // Optimization: if plain object, don't try finding a replacer
-                replace(keypath, value, stateObj);
+                replace(keypath, value, stateObj, promisesData);
             if (replaced !== value) return replaced;
             var clone;
             var isArr = isArray(value);
@@ -7732,25 +7800,35 @@ function Typeson (options) {
                 clone = {};
             else if (isArr)
                 clone = new Array(value.length);
+            else if (keypath === '' && hasConstructorOf(value, TypesonPromise)) {
+                promisesData.push([keypath, value, cyclic, stateObj]);
+                return value;
+            }
             else return value; // Only clone vanilla objects and arrays.
             // Iterate object or array
-            keys(value).forEach(function (key) {
-                var val = _encapsulate(keypath + (keypath ? '.':'') + key, value[key], cyclic, {ownKeys: true});
-                if (val !== undefined) clone[key] = val;
+            keys(value).forEach(function (key, i) {
+                var kp = keypath + (keypath ? '.' : '') + key;
+                var val = _encapsulate(kp, value[key], cyclic, {ownKeys: true}, promisesData);
+                if (hasConstructorOf(val, TypesonPromise)) {
+                    promisesData.push([kp, val, cyclic, {ownKeys: true}, clone, key]);
+                } else if (val !== undefined) clone[key] = val;
             });
             // Iterate array for non-own properties (we can't replace the prior loop though as it iterates non-integer keys)
             if (isArr) {
                 for (var i = 0, vl = value.length; i < vl; i++) {
                     if (!(i in value)) {
-                        var val = _encapsulate(keypath + (keypath ? '.':'') + i, value[i], cyclic, {ownKeys: false});
-                        if (val !== undefined) clone[i] = val;
+                        var kp = keypath + (keypath ? '.' : '') + i;
+                        var val = _encapsulate(kp, value[i], cyclic, {ownKeys: false}, promisesData);
+                        if (hasConstructorOf(val, TypesonPromise)) {
+                            promisesData.push([kp, val, cyclic, {ownKeys: false}, clone, i]);
+                        } else if (val !== undefined) clone[i] = val;
                     }
                 }
             }
             return clone;
         }
 
-        function replace (key, value, stateObj) {
+        function replace (key, value, stateObj, promisesData) {
             // Encapsulate registered types
             var i = replacers.length;
             while (i--) {
@@ -7766,7 +7844,7 @@ function Typeson (options) {
                         types[key] = existing ? [type].concat(existing) : type;
                     }
                     // Now, also traverse the result in case it contains it own types to replace
-                    return _encapsulate(key, replacers[i].replace(value, stateObj), cyclic && "readonly", stateObj);
+                    return _encapsulate(key, replacers[i].replace(value, stateObj), cyclic && 'readonly', stateObj, promisesData);
                 }
             }
             return value;
@@ -7788,7 +7866,7 @@ function Typeson (options) {
             types = types.$;
             ignore$Types = false;
         }
-        var ret = _revive ('', obj);
+        var ret = _revive('', obj);
         return hasConstructorOf(ret, Undefined) ? undefined : ret;
 
         function _revive (keypath, value, target) {
@@ -7798,7 +7876,7 @@ function Typeson (options) {
                 var clone = isArray(value) ? new Array(value.length) : {};
                 // Iterate object or array
                 keys(value).forEach(function (key) {
-                    var val = _revive(keypath + (keypath ? '.':'') + key, value[key], target || clone);
+                    var val = _revive(keypath + (keypath ? '.' : '') + key, value[key], target || clone);
                     if (hasConstructorOf(val, Undefined)) clone[key] = undefined;
                     else if (val !== undefined) clone[key] = val;
                 });
@@ -7806,9 +7884,9 @@ function Typeson (options) {
             }
             if (!type) return value;
             if (type === '#') return getByKeyPath(target, value.substr(1));
-            return [].concat(type).reduce(function(val, type) {
+            return [].concat(type).reduce(function (val, type) {
                 var reviver = revivers[type];
-                if (!reviver) throw new Error ("Unregistered type: " + type);
+                if (!reviver) throw new Error ('Unregistered type: ' + type);
                 return reviver(val);
             }, value);
         }
@@ -7835,9 +7913,9 @@ function Typeson (options) {
                         // Support registering just a class without replacer/reviver
                         var Class = spec;
                         spec = [
-                            function(x){return x.constructor === Class;},
-                            function(x){return assign({}, x)},
-                            function(x){return assign(Object.create(Class.prototype), x)}
+                            function (x) { return x.constructor === Class; },
+                            function (x) { return assign({}, x); },
+                            function (x) { return assign(Object.create(Class.prototype), x); }
                         ];
                     }
                     replacers.push({
@@ -7855,7 +7933,7 @@ function Typeson (options) {
 }
 
 function assign(t,s) {
-    keys(s).map(function(k){t[k]=s[k];});
+    keys(s).map(function (k) { t[k] = s[k]; });
     return t;
 }
 
@@ -7871,9 +7949,62 @@ function getByKeyPath (obj, keyPath) {
 }
 
 function Undefined () {}
-Typeson.Undefined = Undefined;
+
+// With ES6 classes, we may be able to simply use `class TypesonPromise extends Promise` and add a string tag for detection
+function TypesonPromise (f) {
+    if (!(this instanceof TypesonPromise)) {
+        return new TypesonPromise(f);
+    }
+    this.p = new Promise(f);
+};
+Object.defineProperties(TypesonPromise.prototype, {
+    'then': {
+        get: function () {
+            var then = this.p.then.bind(this.p);
+            return function (result) {
+                return new TypesonPromise(function (res) {
+                    res(then(result));
+                });
+            };
+        }
+    },
+    'catch': {
+        get: function () {
+            return this.p.then.bind(this.p);
+        }
+    }
+});
+TypesonPromise.all = function (promArr) {
+    return new TypesonPromise(function (res) {
+        Promise.all(promArr.map(function (prom) {return prom.p;})).then(res);
+    });
+};
+TypesonPromise.race = function (promArr) {
+    return new TypesonPromise(function (res) {
+        Promise.race(promArr.map(function (prom) {return prom.p;})).then(res);
+    });
+};
+TypesonPromise.resolve = function (v) {
+    return new TypesonPromise(function (res) {
+        res(v);
+    });
+};
+TypesonPromise.reject = function (v) {
+    return new TypesonPromise(function (res, rej) {
+        rej(v);
+    });
+};
+
+// The following provide classes meant to avoid clashes with other values
+Typeson.Undefined = Undefined; // To insist `undefined` should be added
+Typeson.Promise = TypesonPromise; // To support async encapsulation/stringification
+
+// Some fundamental type-checking utilities
 Typeson.toStringTag = toStringTag;
 Typeson.hasConstructorOf = hasConstructorOf;
+Typeson.isObject = isObject;
+Typeson.isPlainObject = isPlainObject;
+Typeson.isUserObject = isUserObject;
 
 module.exports = Typeson;
 
